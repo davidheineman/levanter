@@ -1,0 +1,78 @@
+# Example configuration for Collapse + CompleteP training
+#
+# This config demonstrates how to train with:
+# - Collapse scaling (TPP and tau-derived weight decay)
+# - CompleteP depth scaling (residual branch scaling)
+# - MuP width scaling (per-layer LR scaling)
+#
+# Usage:
+#   python -m levanter.main.train_lm_collapse --config config/llama_collapse.yaml
+#
+# The training budget is computed automatically from:
+#   total_tokens = tpp × num_params
+#   num_steps = total_tokens / (batch_size × seq_len)
+#   weight_decay = batch_size / (tau × lr × total_tokens)
+
+# Collapse configuration - the key hyperparameters for scaling
+collapse:
+  tpp: 20.0           # Tokens per parameter ratio
+  tau: 0.05           # AdamW timescale (primary HP to tune at small scale)
+  warmup_fraction: 0.01
+  cooldown_fraction: 0.2
+
+# CompleteP configuration for depth scaling
+# Set depth_multiplier = actual_layers / base_layers
+# For example: if your base model had 12 layers and you're training 24 layers,
+# set depth_multiplier: 2.0
+completep:
+  depth_multiplier: 1.0   # Set to actual_depth / base_depth
+  depth_alpha_exp: 0.5    # Typically 0.5-1.0, controls residual scaling strength
+
+# Learning rate schedule (in normalized time)
+schedule:
+  warmup_fraction: 0.01   # 1% of training for warmup
+  cooldown_fraction: 0.2  # Final 20% for cosine decay
+  min_lr_fraction: 0.1    # Decay to 10% of peak LR
+
+# Model configuration
+model:
+  type: llama
+  hidden_dim: 768
+  intermediate_dim: 2048
+  num_heads: 12
+  num_kv_heads: 12
+  num_layers: 12
+  seq_len: 2048
+  use_mup: true         # Enable MuP for width scaling
+  # completep is set from the top-level completep config
+
+# Data configuration
+data:
+  train_urls:
+    - "gs://your-bucket/data/train.{1..128}-of-128.jsonl.gz"
+  validation_urls:
+    - "gs://your-bucket/data/val.{1..8}-of-8.jsonl.gz"
+  cache_dir: "gs://your-bucket/tokenized/collapse_train/"
+  tokenizer: "NousResearch/Llama-2-7b-hf"
+
+# Trainer configuration
+# Note: num_train_steps will be OVERRIDDEN by Collapse computation
+trainer:
+  tracker:
+    - type: wandb
+      project: "collapse-scaling"
+      tags: ["collapse", "completep", "mup"]
+
+  mp: p=f32,c=bfloat16
+  model_axis_size: 1
+  per_device_parallelism: -1
+  train_batch_size: 256   # In sequences; affects weight_decay computation
+
+# Optimizer settings
+# Note: weight_decay will be DERIVED from tau, not specified here
+base_lr: 1.0e-3
+beta1: 0.9
+beta2: 0.95
+epsilon: 1.0e-8
+max_grad_norm: 1.0
+

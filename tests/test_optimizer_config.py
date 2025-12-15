@@ -1,7 +1,6 @@
 # Copyright 2025 The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
-import dataclasses
 
 import numpy as np
 import jax
@@ -284,8 +283,7 @@ def test_adam_use_mup_scales_updates():
 
     In = Axis("in", 1)
     Out = Axis("out", 1)
-    layer = hax.nn.Linear.init(In, Out, key=jr.PRNGKey(0), use_bias=False)
-    layer = dataclasses.replace(layer, reparam=ConstantScaleReparam(layer.In, layer.Out))
+    layer = hax.nn.Linear.init(In, Out, key=jr.PRNGKey(0), use_bias=False, reparam_cls=ConstantScaleReparam)
 
     params = {"layer": layer}
 

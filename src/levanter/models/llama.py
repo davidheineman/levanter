@@ -14,6 +14,7 @@ import haliax as hax
 import haliax.nn as hnn
 import haliax.nn.mup as mup
 from haliax import Axis, AxisSpec, NamedArray
+from haliax.nn.mup import CompletePConfig
 from haliax.jax_utils import maybe_rng_split, named_call, shaped_rng_split
 from haliax.nn.scan import ScanCheckpointPolicy, Stacked
 from haliax.state_dict import ModuleWithStateDictSerialization
@@ -83,6 +84,13 @@ class LlamaConfig(HFCompatConfig):
 
     use_bias: bool = False
     use_mup: bool = False
+    mup_input_alpha: float = 1.0
+    """Tunable multiplier applied to input embeddings when use_mup=True."""
+    mup_output_alpha: float = 1.0
+    """Tunable multiplier applied to output logits when use_mup=True."""
+    completep: Optional[CompletePConfig] = None
+    """CompleteP configuration for depth scaling. If set, enables residual branch scaling
+    and depth-aware LR scaling for hyperparameter transfer across depths."""
     use_layer_norm_weight: bool = True
     rope: RotaryEmbeddingsConfig = dataclasses.field(default_factory=DefaultRotaryEmbeddingsConfig)
 
@@ -97,9 +105,9 @@ class LlamaConfig(HFCompatConfig):
     Mlp = property(lambda self: Axis(name="mlp", size=self.intermediate_dim))
 
     def __post_init__(self):
-        assert self.num_heads % self.num_kv_heads == 0, (
-            f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
-        )
+        assert (
+            self.num_heads % self.num_kv_heads == 0
+        ), f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
 
     def hf_checkpoint_converter(self, ref_checkpoint: Optional[str] = None) -> HFCheckpointConverter["LlamaConfig"]:  # type: ignore
         return HFCheckpointConverter(
@@ -249,6 +257,17 @@ class LlamaConfig(HFCompatConfig):
             return self.head_dim
         return self.hidden_dim // self.num_heads
 
+    @property
+    def residual_scale(self) -> float:
+        """Returns the residual branch scaling factor for CompleteP.
+
+        If completep is configured, returns 1/(depth_multiplier^depth_alpha_exp).
+        Otherwise returns 1.0 (no scaling).
+        """
+        if self.completep is None:
+            return 1.0
+        return self.completep.residual_scale
+
 
 class LlamaMlp(eqx.Module):
     """Multi-layer Perceptron
@@ -320,6 +339,7 @@ class LlamaDecoderLayer(eqx.Module):
     post_attention_layernorm: hnn.RmsNorm
     post_attn_layernorm: Optional[hnn.RmsNorm] = None
     post_mlp_layernorm: Optional[hnn.RmsNorm] = None
+    residual_scale: float = eqx.field(static=True, default=1.0)
 
     @staticmethod
     def init(config: LlamaConfig, *, key) -> "LlamaDecoderLayer":
@@ -342,7 +362,11 @@ class LlamaDecoderLayer(eqx.Module):
         if config.hybrid_norm:
             post_attn_ln = config.mk_LayerNorm(config.Embed)
             post_mlp_ln = config.mk_LayerNorm(config.Embed)
-        return LlamaDecoderLayer(config, attn, mlp, ln_1, ln_2, post_attn_ln, post_mlp_ln)
+
+        # Get residual scale from CompleteP config
+        residual_scale = config.residual_scale
+
+        return LlamaDecoderLayer(config, attn, mlp, ln_1, ln_2, post_attn_ln, post_mlp_ln, residual_scale)
 
     @named_call
     def __call__(
@@ -355,7 +379,8 @@ class LlamaDecoderLayer(eqx.Module):
         attn_output = self.self_attn(x=x, mask=mask, key=k_attn, pos_ids=pos_ids)
         if self.post_attn_layernorm is not None:
             attn_output = self.post_attn_layernorm(attn_output)
-        x = residual + attn_output
+        # CompleteP: scale residual branch to prevent activation growth with depth
+        x = residual + self.residual_scale * attn_output
 
         # MLP and skip connection
         residual = x
@@ -363,7 +388,8 @@ class LlamaDecoderLayer(eqx.Module):
         mlp_output = self.mlp(x, key=k_mlp)
         if self.post_mlp_layernorm is not None:
             mlp_output = self.post_mlp_layernorm(mlp_output)
-        output = residual + mlp_output
+        # CompleteP: scale residual branch to prevent activation growth with depth
+        output = residual + self.residual_scale * mlp_output
         return output
 
     @named_call
@@ -384,7 +410,8 @@ class LlamaDecoderLayer(eqx.Module):
 
         if self.post_attn_layernorm is not None:
             attn_output = self.post_attn_layernorm(attn_output)
-        x = residual + attn_output
+        # CompleteP: scale residual branch
+        x = residual + self.residual_scale * attn_output
 
         # MLP and skip connection
         residual = x
@@ -392,7 +419,8 @@ class LlamaDecoderLayer(eqx.Module):
         mlp_output = self.mlp(x, key=k_mlp)
         if self.post_mlp_layernorm is not None:
             mlp_output = self.post_mlp_layernorm(mlp_output)
-        output = residual + mlp_output
+        # CompleteP: scale residual branch
+        output = residual + self.residual_scale * mlp_output
         return output, kv_cache
 
     def initial_cache(self, spec: PageTableSpec, *, dtype) -> KvPageCache:
@@ -497,6 +525,8 @@ class LlamaEmbedding(ModuleWithStateDictSerialization, eqx.Module):
 
     token_embeddings: hnn.Embedding
     norm: Optional[hnn.RmsNorm] = None
+    mup_input_alpha: float = eqx.field(default=1.0, static=True)
+    """muP input embedding multiplier (only applied when use_mup=True)."""
 
     @staticmethod
     def init(Vocab: Axis, config: LlamaConfig, *, key) -> "LlamaEmbedding":
@@ -509,7 +539,8 @@ class LlamaEmbedding(ModuleWithStateDictSerialization, eqx.Module):
         norm = None
         if config.input_embedding_norm:
             norm = config.mk_LayerNorm(config.Embed)
-        return LlamaEmbedding(token_embeddings, norm)
+        mup_input_alpha = config.mup_input_alpha if config.use_mup else 1.0
+        return LlamaEmbedding(token_embeddings, norm, mup_input_alpha)
 
     @property
     def Vocab(self) -> Axis:
@@ -522,6 +553,9 @@ class LlamaEmbedding(ModuleWithStateDictSerialization, eqx.Module):
     @named_call
     def embed(self, input_ids, *args):
         input_embeds = self.token_embeddings(input_ids)
+        # Apply muP input scaling
+        if self.mup_input_alpha != 1.0:
+            input_embeds = input_embeds * self.mup_input_alpha
         if self.norm is not None:
             input_embeds = self.norm(input_embeds)
         return input_embeds
@@ -541,6 +575,8 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
     transformer: LlamaTransformer
     embeddings: LlamaEmbedding
     lm_head: Optional[hnn.Linear]
+    mup_output_alpha: float = eqx.field(default=1.0, static=True)
+    """muP output logit multiplier (only applied when use_mup=True)."""
 
     @property
     def config(self):
@@ -570,8 +606,9 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
                 out_first=True,
                 reparam_cls=hnn.Linear.output_reparam(use_mup=config.use_mup),
             )
+        mup_output_alpha = config.mup_output_alpha if config.use_mup else 1.0
 
-        return LlamaLMHeadModel(transformer, embeddings, lm_head)
+        return LlamaLMHeadModel(transformer, embeddings, lm_head, mup_output_alpha)
 
     def __call__(
         self,
@@ -596,6 +633,9 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
         k_t, k_head = maybe_rng_split(key, 2)
         x = self.embeddings.embed(input_ids)
         x = self.transformer(x, attn_mask=attn_mask, key=k_t, pos_ids=pos_ids)
+        # Apply muP output scaling before computing logits
+        if self.mup_output_alpha != 1.0:
+            x = x * self.mup_output_alpha
         if self.lm_head:
             lm_logits = self.lm_head(x, key=k_head)
         else:
@@ -693,6 +733,10 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
         # Propagate through the transformer with paged-KV caching
         k_t = maybe_rng_split(key, 1)[0] if key is not None else None
         x, new_state = self.transformer.decode(kv_cache, x, batch_info, pos_ids, key=k_t)
+
+        # Apply muP output scaling before computing logits
+        if self.mup_output_alpha != 1.0:
+            x = x * self.mup_output_alpha
 
         # Project to logits
         if self.lm_head is not None:

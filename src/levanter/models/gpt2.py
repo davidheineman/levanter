@@ -13,6 +13,7 @@ from jaxtyping import PRNGKeyArray
 import haliax as hax
 import haliax.jax_utils
 import haliax.nn as hnn
+import haliax.nn.mup as mup
 from haliax import Axis, NamedArray
 from haliax.jax_utils import named_call, shaped_rng_split
 from haliax.nn.scan import Stacked
@@ -57,6 +58,11 @@ class Gpt2Config(HFCompatConfig):
     gradient_checkpointing: bool = True  # better to just always use this
 
     use_bias: bool = True
+    use_mup: bool = False
+    mup_input_alpha: float = 1.0
+    """Tunable multiplier applied to input embeddings when use_mup=True."""
+    mup_output_alpha: float = 1.0
+    """Tunable multiplier applied to output logits when use_mup=True."""
 
     use_flash_attention: Optional[bool] = None
     attn_backend: Optional[AttentionBackend] = None
@@ -136,11 +142,31 @@ class Gpt2Mlp(eqx.Module):
 
     @staticmethod
     def init(
-        Embed: Axis, Mlp: Axis, activation_fn: Union[ActivationFunctionEnum, Callable], *, key, use_bias: bool = True
+        Embed: Axis,
+        Mlp: Axis,
+        activation_fn: Union[ActivationFunctionEnum, Callable],
+        *,
+        key,
+        use_bias: bool = True,
+        use_mup: bool = False,
     ) -> "Gpt2Mlp":
         k_fc, k_proj = jrandom.split(key, 2)
-        c_fc = hnn.Linear.init(Out=Mlp, In=Embed, key=k_fc, use_bias=use_bias, out_first=False)
-        c_proj = hnn.Linear.init(Out=Embed, In=Mlp, key=k_proj, use_bias=use_bias, out_first=False)
+        c_fc = hnn.Linear.init(
+            Out=Mlp,
+            In=Embed,
+            key=k_fc,
+            use_bias=use_bias,
+            out_first=False,
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
+        )
+        c_proj = hnn.Linear.init(
+            Out=Embed,
+            In=Mlp,
+            key=k_proj,
+            use_bias=use_bias,
+            out_first=False,
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
+        )
         if isinstance(activation_fn, ActivationFunctionEnum):
             activation_fn = activation_fn.to_fn()
 
@@ -161,22 +187,37 @@ class Gpt2Attention(eqx.Module):
     c_attn: hnn.Linear  # input projection from [embed] -> [(q, k, v), heads, head_dim]
     c_proj: hnn.Linear  # output projection from [heads, head_dim] -> [embed]
     inference: bool
+    scaling_factor: Optional[float] = None  # muP uses 1/d_k instead of 1/sqrt(d_k)
 
     @staticmethod
     def init(config: Gpt2Config, *, key) -> "Gpt2Attention":
         Qkv = Axis("qkv", size=3)
         use_bias = config.use_bias
+        use_mup = config.use_mup
         Embed = config.Embed
 
         k_c, k_proj = jrandom.split(key, 2)
         c_attn = hnn.Linear.init(
-            In=Embed, Out=(Qkv, config.Heads, config.HeadSize), key=k_c, use_bias=use_bias, out_first=False
+            In=Embed,
+            Out=(Qkv, config.Heads, config.HeadSize),
+            key=k_c,
+            use_bias=use_bias,
+            out_first=False,
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
         )
         c_proj = hnn.Linear.init(
-            In=(config.Heads, config.HeadSize), Out=Embed, key=k_proj, use_bias=use_bias, out_first=False
+            In=(config.Heads, config.HeadSize),
+            Out=Embed,
+            key=k_proj,
+            use_bias=use_bias,
+            out_first=False,
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
         )
 
-        return Gpt2Attention(config, c_attn, c_proj, inference=False)
+        # muP uses 1/d_k scaling instead of 1/sqrt(d_k)
+        scaling_factor = 1.0 / config.HeadSize.size if use_mup else None
+
+        return Gpt2Attention(config, c_attn, c_proj, inference=False, scaling_factor=scaling_factor)
 
     @named_call
     def __call__(self, x: NamedArray, mask: Optional[AttentionMask | NamedArray], layer_idx, *, key):
@@ -206,6 +247,7 @@ class Gpt2Attention(eqx.Module):
             flash_block_size=self.config.flash_attention_block_size,
             prng=k_drop,
             attention_dtype=jnp.float32 if self.config.upcast_attn else None,
+            scaling_factor=self.scaling_factor,
         )
 
         attn_output = attn_output.astype(x.dtype)
@@ -228,7 +270,14 @@ class Gpt2Block(eqx.Module):
         ln_1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_bias=config.use_bias)
         attn = Gpt2Attention.init(config, key=k_attn)
         ln_2 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_bias=config.use_bias)
-        mlp = Gpt2Mlp.init(config.Embed, config.Mlp, config.activation_function, key=k_mlp, use_bias=config.use_bias)
+        mlp = Gpt2Mlp.init(
+            config.Embed,
+            config.Mlp,
+            config.activation_function,
+            key=k_mlp,
+            use_bias=config.use_bias,
+            use_mup=config.use_mup,
+        )
         resid_dropout = hnn.Dropout(pdrop=config.resid_pdrop)
 
         return Gpt2Block(ln_1, attn, ln_2, mlp, resid_dropout)
@@ -283,26 +332,36 @@ class Gpt2Embeddings(ModuleWithStateDictSerialization, eqx.Module):
     token_embeddings: hnn.Embedding
     position_embeddings: hnn.Embedding
     dropout: hnn.Dropout
+    mup_input_alpha: float = eqx.field(default=1.0, static=True)
+    """muP input embedding multiplier (only applied when use_mup=True)."""
 
     @staticmethod
     def init(Vocab: Axis, config: Gpt2Config, *, key) -> "Gpt2Embeddings":
         k_wte, k_wpe, k_out = jrandom.split(key, 3)
 
         token_embeddings = hnn.Embedding.init(
-            Vocab, config.Embed, key=k_wte, initializer_range=config.initializer_range
+            Vocab,
+            config.Embed,
+            key=k_wte,
+            initializer_range=config.initializer_range,
+            reparam_cls=mup.EmbeddingMup if config.use_mup else mup.EmbeddingStandardParam,
         )
         position_embeddings = hnn.Embedding.init(
             config.Pos, config.Embed, key=k_wpe, initializer_range=config.initializer_range / 2
         )
         dropout = hnn.Dropout(pdrop=config.embed_pdrop)
+        mup_input_alpha = config.mup_input_alpha if config.use_mup else 1.0
 
-        return Gpt2Embeddings(Vocab, config, token_embeddings, position_embeddings, dropout)
+        return Gpt2Embeddings(Vocab, config, token_embeddings, position_embeddings, dropout, mup_input_alpha)
 
     @named_call
     def embed(self, input_ids, *, key, pos_ids: NamedArray):
         input_embeds = self.token_embeddings(input_ids)
         position_embeds = self.position_embeddings.embed(pos_ids)
         x = input_embeds + position_embeds
+        # Apply muP input scaling
+        if self.mup_input_alpha != 1.0:
+            x = x * self.mup_input_alpha
         x = self.dropout(x, key=key)
 
         return x
@@ -321,6 +380,8 @@ class Gpt2Embeddings(ModuleWithStateDictSerialization, eqx.Module):
 class Gpt2LMHeadModel(LmWithHfSerializationMixin[Gpt2Config]):
     transformer: Gpt2Transformer
     embeddings: Gpt2Embeddings
+    mup_output_alpha: float = eqx.field(default=1.0, static=True)
+    """muP output logit multiplier (only applied when use_mup=True)."""
 
     @property
     def config(self):
@@ -339,8 +400,27 @@ class Gpt2LMHeadModel(LmWithHfSerializationMixin[Gpt2Config]):
         k_t, k_embeddings = jrandom.split(key, 2)
         transformer = Gpt2Transformer.init(config, key=k_t)
         embeddings = Gpt2Embeddings.init(Vocab, config, key=k_embeddings)
+        mup_output_alpha = config.mup_output_alpha if config.use_mup else 1.0
 
-        return Gpt2LMHeadModel(transformer, embeddings)
+        return Gpt2LMHeadModel(transformer, embeddings, mup_output_alpha)
+
+    def __call__(
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+    ) -> NamedArray:
+        """
+        Compute the logits for the next token in a sequence.
+        """
+        x = self.activations(input_ids, attn_mask, key=key, pos_ids=pos_ids)
+        # Apply muP output scaling before computing logits
+        if self.mup_output_alpha != 1.0:
+            x = x * self.mup_output_alpha
+        lm_logits = self.embeddings.unembed(x)
+        return lm_logits
 
     def activations(
         self,

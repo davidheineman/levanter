@@ -91,7 +91,8 @@ def test_llama_use_mup_sets_reparam_classes(use_mup):
     attn_config = config.attention_config()
     assert attn_config.use_mup is use_mup
     if use_mup:
-        assert attn_config.scaling_factor == 1.0
+        # muP uses 1/head_size scaling instead of 1/sqrt(head_size)
+        assert attn_config.scaling_factor == 1.0 / attn_config.head_size
     else:
         assert attn_config.scaling_factor is None
 
@@ -111,8 +112,9 @@ def test_llama_use_mup_sets_reparam_classes(use_mup):
     assert isinstance(decoder_layer.mlp.down_proj.reparam, expected_hidden_cls)
 
     self_attn = decoder_layer.self_attn
-    assert isinstance(self_attn.q_proj.reparam, expected_output_cls)
-    assert isinstance(self_attn.k_proj.reparam, expected_output_cls)
+    # All attention projections use hidden reparam in muP
+    assert isinstance(self_attn.q_proj.reparam, expected_hidden_cls)
+    assert isinstance(self_attn.k_proj.reparam, expected_hidden_cls)
     assert isinstance(self_attn.v_proj.reparam, expected_hidden_cls)
     assert isinstance(self_attn.o_proj.reparam, expected_hidden_cls)
 

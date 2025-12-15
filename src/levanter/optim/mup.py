@@ -21,9 +21,11 @@ def _scale_module_updates(updates: Any, lr_scale: float) -> Any:
 
     ``optax`` maintains the PyTree structure of the parameters inside the updates, so
     the incoming ``updates`` value is typically another :class:`ReparamEnabled`
-    module. We still want to descend into that module and scale its array leaves, but
-    we should stop the recursion once we hit *nested* MuP-enabled modules so that
-    each module gets scaled exactly once.
+    module. We descend into the module to scale its array leaves.
+
+    Note: We don't use ``is_leaf`` here because we want to reach the actual array
+    leaves inside the module. Nested modules will be handled by the outer tree_map
+    in ``scale_by_mup_lr``.
     """
 
     def _maybe_scale(leaf: Any) -> Any:
@@ -31,10 +33,7 @@ def _scale_module_updates(updates: Any, lr_scale: float) -> Any:
             return leaf * lr_scale
         return leaf
 
-    def _is_reparam_enabled(node: Any) -> bool:
-        return isinstance(node, ReparamEnabled)
-
-    return jax.tree_util.tree_map(_maybe_scale, updates, is_leaf=_is_reparam_enabled)
+    return jax.tree_util.tree_map(_maybe_scale, updates)
 
 
 def scale_by_mup_lr() -> GradientTransformation:

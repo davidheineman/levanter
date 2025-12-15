@@ -10,6 +10,10 @@ __all__ = [
     "ScaleByAdoptState",
     # cautious
     "CautiousConfig",
+    # collapse
+    "CollapseOptimizerConfig",
+    "CollapseScheduleConfig",
+    "CollapseTrainingBudget",
     # config
     "AdamConfig",
     "AdamHConfig",
@@ -47,6 +51,7 @@ __all__ = [
 from .adam_mini import MiniConfig, ScaleByMiniState
 from .adopt import AdoptConfig, ScaleByAdoptState
 from .cautious import CautiousConfig
+from .collapse import CollapseOptimizerConfig, CollapseScheduleConfig, CollapseTrainingBudget
 from .config import AdamConfig, LionConfig, OptimizerConfig
 from .adamh import AdamHConfig
 from .kron import KronConfig
