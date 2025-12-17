@@ -3,215 +3,164 @@
 
 """Collapse training configuration and utilities.
 
-This module provides configuration for "Scaling with Collapse" training,
-which enables predictable loss curves across model scales by enforcing:
-- Fixed tokens-per-parameter (TPP) ratio
-- Fixed AdamW timescale (τ) 
-- Normalized LR scheduling
+This module re-exports Collapse training utilities from haliax and adds
+Levanter-specific helpers.
 
-Combined with CompleteP parameterization, this enables hyperparameter
-transfer across both width and depth.
+Collapse enables predictable loss curves across model scales by fixing:
+- TPP (tokens-per-parameter): determines training duration
+- τ (tau): AdamW timescale, determines weight decay
+
+Usage with train_lm.py:
+    from levanter.optim.collapse import CollapseConfig
+
+    collapse = CollapseConfig(tpp=20.0, tau=0.05)
+
+    # Compute training parameters
+    total_tokens = collapse.compute_total_tokens(num_params)
+    num_steps = collapse.compute_total_steps(num_params, batch_size, seq_len)
+    weight_decay = collapse.compute_weight_decay(learning_rate, batch_size * seq_len, total_tokens)
+
+    # Use these in your TrainerConfig and OptimizerConfig
 """
 
-from dataclasses import dataclass, field
-from typing import Optional
+import logging
+from typing import NamedTuple
 
-import draccus
+# Re-export from haliax
+from haliax.nn.collapse import (
+    CollapseConfig,
+    CollapseTracker,
+    NormalizedSchedule,
+    make_lr_schedule,
+    validate_collapse_config,
+)
 
-from haliax.nn.collapse import CollapseConfig, NormalizedSchedule, validate_collapse_config
-from haliax.nn.mup import CompletePConfig
+__all__ = [
+    # From haliax
+    "CollapseConfig",
+    "CollapseTracker",
+    "NormalizedSchedule",
+    "make_lr_schedule",
+    "validate_collapse_config",
+    # Levanter helpers
+    "CollapseTrainingParams",
+    "compute_collapse_training_params",
+    "estimate_params_from_config",
+]
 
-
-@dataclass(frozen=True)
-class CollapseOptimizerConfig:
-    """Optimizer configuration derived from Collapse constraints.
-
-    Instead of specifying weight_decay directly, it is derived from the
-    AdamW timescale τ. This ensures consistent optimization dynamics
-    across model scales.
-
-    Attributes:
-        collapse: Core Collapse configuration (TPP, tau).
-        base_lr: Peak learning rate.
-        beta1: Adam beta1.
-        beta2: Adam beta2.
-        epsilon: Adam epsilon (will be scaled by width/depth if using CompleteP).
-        max_grad_norm: Gradient clipping norm.
-        use_mup: Enable MuP LR scaling.
-    """
-
-    collapse: CollapseConfig = field(default_factory=CollapseConfig)
-
-    base_lr: float = 1e-3
-    beta1: float = 0.9
-    beta2: float = 0.95
-    epsilon: float = 1e-8
-    max_grad_norm: Optional[float] = 1.0
-    use_mup: bool = True
-
-    def compute_weight_decay(
-        self,
-        batch_size_tokens: int,
-        total_tokens: int,
-    ) -> float:
-        """Derive weight decay from AdamW timescale τ.
-
-        Args:
-            batch_size_tokens: Batch size in tokens.
-            total_tokens: Total training tokens.
-
-        Returns:
-            Weight decay coefficient.
-        """
-        return self.collapse.compute_weight_decay(
-            learning_rate=self.base_lr,
-            batch_size=batch_size_tokens,
-            total_tokens=total_tokens,
-        )
-
-    def compute_epsilon(
-        self,
-        completep_config: Optional[CompletePConfig] = None,
-        width_multiplier: float = 1.0,
-    ) -> float:
-        """Compute scaled Adam epsilon for CompleteP.
-
-        Args:
-            completep_config: Optional CompleteP config for depth scaling.
-            width_multiplier: Width multiplier for MuP scaling.
-
-        Returns:
-            Scaled epsilon value.
-        """
-        if completep_config is None:
-            return self.epsilon
-        return self.epsilon * completep_config.adam_epsilon_scale(width_multiplier)
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class CollapseScheduleConfig:
-    """Learning rate schedule configuration for Collapse training.
+class CollapseTrainingParams(NamedTuple):
+    """Result of computing Collapse training parameters."""
 
-    Uses normalized time (t̂ = step / total_steps) to ensure identical
-    schedule shapes across model scales.
-    """
-
-    warmup_fraction: float = 0.01
-    cooldown_fraction: float = 0.2
-    min_lr_fraction: float = 0.1
-
-    def to_normalized_schedule(self) -> NormalizedSchedule:
-        """Convert to NormalizedSchedule."""
-        return NormalizedSchedule(
-            warmup_fraction=self.warmup_fraction,
-            cooldown_fraction=self.cooldown_fraction,
-            min_lr_fraction=self.min_lr_fraction,
-        )
-
-    @classmethod
-    def from_collapse_config(cls, config: CollapseConfig) -> "CollapseScheduleConfig":
-        """Create from CollapseConfig defaults."""
-        return cls(
-            warmup_fraction=config.warmup_fraction,
-            cooldown_fraction=config.cooldown_fraction,
-        )
-
-
-@dataclass
-class CollapseTrainingBudget:
-    """Computed training budget from Collapse constraints.
-
-    This is the result of applying CollapseConfig to a specific model size.
-    All derived values are computed here.
-    """
-
-    num_params: int
-    total_tokens: int
-    total_steps: int
-    batch_size_tokens: int
+    num_train_steps: int
     weight_decay: float
-    base_lr: float
+    total_tokens: int
 
-    # Collapse diagnostics
-    actual_tpp: float
-    actual_tau: float
 
-    @classmethod
-    def compute(
-        cls,
-        num_params: int,
-        batch_size: int,
-        seq_len: int,
-        optimizer_config: CollapseOptimizerConfig,
-    ) -> "CollapseTrainingBudget":
-        """Compute training budget from model size and Collapse config.
+def compute_collapse_training_params(
+    collapse: CollapseConfig,
+    num_params: int,
+    batch_size: int,
+    seq_len: int,
+    learning_rate: float,
+) -> CollapseTrainingParams:
+    """Compute all training parameters from Collapse config.
 
-        Args:
-            num_params: Number of trainable parameters.
-            batch_size: Batch size in sequences.
-            seq_len: Sequence length.
-            optimizer_config: Collapse optimizer configuration.
+    This is a convenience function that calls CollapseConfig methods
+    and returns a NamedTuple with all the values you need.
 
-        Returns:
-            Fully computed training budget.
-        """
-        collapse = optimizer_config.collapse
-        batch_size_tokens = batch_size * seq_len
+    Args:
+        collapse: Collapse configuration with tpp and tau.
+        num_params: Number of trainable parameters.
+        batch_size: Batch size in sequences.
+        seq_len: Sequence length.
+        learning_rate: Peak learning rate.
 
-        total_tokens = collapse.compute_total_tokens(num_params)
-        total_steps = collapse.compute_total_steps(num_params, batch_size, seq_len)
-        weight_decay = collapse.compute_weight_decay(
-            learning_rate=optimizer_config.base_lr,
-            batch_size=batch_size_tokens,
-            total_tokens=total_tokens,
+    Returns:
+        CollapseTrainingParams with num_train_steps, weight_decay, total_tokens.
+
+    Example:
+        collapse = CollapseConfig(tpp=20.0, tau=0.05)
+        params = compute_collapse_training_params(
+            collapse, num_params=125_000_000, batch_size=256,
+            seq_len=2048, learning_rate=1e-3
         )
+        # params.num_train_steps, params.weight_decay, params.total_tokens
+    """
+    batch_size_tokens = batch_size * seq_len
+    total_tokens = collapse.compute_total_tokens(num_params)
+    num_train_steps = collapse.compute_total_steps(num_params, batch_size, seq_len)
+    weight_decay = collapse.compute_weight_decay(learning_rate, batch_size_tokens, total_tokens)
 
-        # Compute actual values for validation
-        actual_tpp = total_tokens / num_params
-        actual_tau = batch_size_tokens / (optimizer_config.base_lr * weight_decay * total_tokens)
+    return CollapseTrainingParams(
+        num_train_steps=num_train_steps,
+        weight_decay=weight_decay,
+        total_tokens=total_tokens,
+    )
 
-        return cls(
-            num_params=num_params,
-            total_tokens=total_tokens,
-            total_steps=total_steps,
-            batch_size_tokens=batch_size_tokens,
-            weight_decay=weight_decay,
-            base_lr=optimizer_config.base_lr,
-            actual_tpp=actual_tpp,
-            actual_tau=actual_tau,
-        )
 
-    def validate(self, config: CollapseConfig, tolerance: float = 0.01) -> bool:
-        """Validate that computed budget matches Collapse constraints.
+def estimate_params_from_config(model_config, vocab_size: int) -> int:
+    """Estimate parameter count from model config.
 
-        Args:
-            config: Expected Collapse configuration.
-            tolerance: Relative tolerance for matching.
+    Args:
+        model_config: Model configuration (e.g., LlamaConfig).
+        vocab_size: Vocabulary size.
 
-        Returns:
-            True if budget is consistent with Collapse constraints.
-        """
-        is_valid, _ = validate_collapse_config(
-            num_params=self.num_params,
-            batch_size=self.batch_size_tokens,
-            learning_rate=self.base_lr,
-            weight_decay=self.weight_decay,
-            total_tokens=self.total_tokens,
-            config=config,
-            tolerance=tolerance,
-        )
-        return is_valid
+    Returns:
+        Estimated number of trainable parameters.
+    """
+    if hasattr(model_config, "total_trainable_params"):
+        return model_config.total_trainable_params(vocab_size)
 
-    def to_hyperparameters(self) -> dict:
-        """Return dict suitable for logging as hyperparameters."""
-        return {
-            "collapse/num_params": self.num_params,
-            "collapse/total_tokens": self.total_tokens,
-            "collapse/total_steps": self.total_steps,
-            "collapse/batch_size_tokens": self.batch_size_tokens,
-            "collapse/weight_decay": self.weight_decay,
-            "collapse/base_lr": self.base_lr,
-            "collapse/actual_tpp": self.actual_tpp,
-            "collapse/actual_tau": self.actual_tau,
-        }
+    # Rough estimate for transformer: 12 * n_layers * hidden_dim^2
+    if hasattr(model_config, "num_layers") and hasattr(model_config, "hidden_dim"):
+        estimate = 12 * model_config.num_layers * model_config.hidden_dim**2
+        logger.warning(f"Using rough parameter estimate: {estimate:,}")
+        return estimate
 
+    raise ValueError(
+        "Cannot estimate parameters. Model config should have "
+        "total_trainable_params() method or num_layers/hidden_dim attributes."
+    )
+
+
+def log_collapse_params(
+    collapse: CollapseConfig,
+    params: CollapseTrainingParams,
+    num_params: int,
+) -> dict:
+    """Log Collapse training parameters and return dict for tracking.
+
+    Args:
+        collapse: Collapse configuration.
+        params: Computed training parameters.
+        num_params: Number of model parameters.
+
+    Returns:
+        Dict suitable for levanter.tracker.log_hyperparameters()
+    """
+    # Compute actual values for validation
+    actual_tpp = params.total_tokens / num_params
+
+    info = {
+        "collapse/tpp": collapse.tpp,
+        "collapse/tau": collapse.tau,
+        "collapse/warmup_fraction": collapse.warmup_fraction,
+        "collapse/cooldown_fraction": collapse.cooldown_fraction,
+        "collapse/num_params": num_params,
+        "collapse/total_tokens": params.total_tokens,
+        "collapse/num_train_steps": params.num_train_steps,
+        "collapse/weight_decay": params.weight_decay,
+        "collapse/actual_tpp": actual_tpp,
+    }
+
+    logger.info("Collapse Training Parameters:")
+    logger.info(f"  TPP: {actual_tpp:.2f} (target: {collapse.tpp})")
+    logger.info(f"  Parameters: {num_params:,}")
+    logger.info(f"  Total tokens: {params.total_tokens:,}")
+    logger.info(f"  Training steps: {params.num_train_steps:,}")
+    logger.info(f"  Weight decay: {params.weight_decay:.6f}")
+
+    return info

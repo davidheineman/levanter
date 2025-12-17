@@ -1,38 +1,28 @@
-# Example configuration for Collapse + CompleteP training
+# Example configuration for Collapse training with Llama
 #
-# This config demonstrates how to train with:
-# - Collapse scaling (TPP and tau-derived weight decay)
-# - CompleteP depth scaling (residual branch scaling)
-# - MuP width scaling (per-layer LR scaling)
+# Collapse enables predictable loss curves across model scales by fixing:
+# - TPP (tokens-per-parameter): determines training duration
+# - τ (tau): AdamW timescale, determines weight decay
 #
 # Usage:
-#   python -m levanter.main.train_lm_collapse --config config/llama_collapse.yaml
+#   # In your training script, compute the training params:
+#   from levanter.optim import CollapseConfig, estimate_params_from_config
 #
-# The training budget is computed automatically from:
+#   collapse = CollapseConfig(tpp=20.0, tau=0.05)
+#   num_params = estimate_params_from_config(config.model, vocab_size)
+#   params = collapse.compute_training_params(
+#       num_params=num_params,
+#       batch_size=config.trainer.train_batch_size,
+#       seq_len=config.model.seq_len,
+#       learning_rate=config.optimizer.learning_rate,
+#   )
+#   # Then set: trainer.num_train_steps = params.num_train_steps
+#   #           optimizer.weight_decay = params.weight_decay
+#
+# The training budget is computed as:
 #   total_tokens = tpp × num_params
 #   num_steps = total_tokens / (batch_size × seq_len)
 #   weight_decay = batch_size / (tau × lr × total_tokens)
-
-# Collapse configuration - the key hyperparameters for scaling
-collapse:
-  tpp: 20.0           # Tokens per parameter ratio
-  tau: 0.05           # AdamW timescale (primary HP to tune at small scale)
-  warmup_fraction: 0.01
-  cooldown_fraction: 0.2
-
-# CompleteP configuration for depth scaling
-# Set depth_multiplier = actual_layers / base_layers
-# For example: if your base model had 12 layers and you're training 24 layers,
-# set depth_multiplier: 2.0
-completep:
-  depth_multiplier: 1.0   # Set to actual_depth / base_depth
-  depth_alpha_exp: 0.5    # Typically 0.5-1.0, controls residual scaling strength
-
-# Learning rate schedule (in normalized time)
-schedule:
-  warmup_fraction: 0.01   # 1% of training for warmup
-  cooldown_fraction: 0.2  # Final 20% for cosine decay
-  min_lr_fraction: 0.1    # Decay to 10% of peak LR
 
 # Model configuration
 model:
@@ -43,8 +33,7 @@ model:
   num_kv_heads: 12
   num_layers: 12
   seq_len: 2048
-  use_mup: true         # Enable MuP for width scaling
-  # completep is set from the top-level completep config
+  use_mup: true  # Recommended for width scaling
 
 # Data configuration
 data:
@@ -56,23 +45,40 @@ data:
   tokenizer: "NousResearch/Llama-2-7b-hf"
 
 # Trainer configuration
-# Note: num_train_steps will be OVERRIDDEN by Collapse computation
 trainer:
   tracker:
     - type: wandb
       project: "collapse-scaling"
-      tags: ["collapse", "completep", "mup"]
+      tags: ["collapse", "mup"]
 
   mp: p=f32,c=bfloat16
   model_axis_size: 1
   per_device_parallelism: -1
-  train_batch_size: 256   # In sequences; affects weight_decay computation
+  train_batch_size: 256
 
-# Optimizer settings
-# Note: weight_decay will be DERIVED from tau, not specified here
-base_lr: 1.0e-3
-beta1: 0.9
-beta2: 0.95
-epsilon: 1.0e-8
-max_grad_norm: 1.0
+  # NOTE: num_train_steps should be set programmatically from CollapseConfig
+  # For a 125M param model with TPP=20, batch=256, seq=2048:
+  #   total_tokens = 20 * 125M = 2.5B
+  #   num_steps = 2.5B / (256 * 2048) = 4768
+  num_train_steps: 4768
 
+# Optimizer configuration
+optimizer:
+  type: adam
+  learning_rate: 1.0e-3
+  beta1: 0.9
+  beta2: 0.95
+  epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  use_mup: true
+
+  # NOTE: weight_decay should be set programmatically from CollapseConfig
+  # For tau=0.05, batch=256*2048, lr=1e-3, total_tokens=2.5B:
+  #   weight_decay = (256*2048) / (0.05 * 1e-3 * 2.5B) ≈ 4.19
+  # This is high because it's the "decoupled" form - effective decay is lr * weight_decay
+  weight_decay: 4.19
+  decoupled_weight_decay: true
+
+  # Use warmup/cooldown fractions matching Collapse schedule
+  warmup: 0.01        # 1% warmup
+  min_lr_ratio: 0.1   # Decay to 10% of peak

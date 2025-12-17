@@ -10,10 +10,15 @@ __all__ = [
     "ScaleByAdoptState",
     # cautious
     "CautiousConfig",
-    # collapse
-    "CollapseOptimizerConfig",
-    "CollapseScheduleConfig",
-    "CollapseTrainingBudget",
+    # collapse (re-exported from haliax + levanter helpers)
+    "CollapseConfig",
+    "CollapseTracker",
+    "CollapseTrainingParams",
+    "NormalizedSchedule",
+    "compute_collapse_training_params",
+    "estimate_params_from_config",
+    "log_collapse_params",
+    "make_lr_schedule",
     # config
     "AdamConfig",
     "AdamHConfig",
@@ -51,7 +56,16 @@ __all__ = [
 from .adam_mini import MiniConfig, ScaleByMiniState
 from .adopt import AdoptConfig, ScaleByAdoptState
 from .cautious import CautiousConfig
-from .collapse import CollapseOptimizerConfig, CollapseScheduleConfig, CollapseTrainingBudget
+from .collapse import (
+    CollapseConfig,
+    CollapseTracker,
+    CollapseTrainingParams,
+    NormalizedSchedule,
+    compute_collapse_training_params,
+    estimate_params_from_config,
+    log_collapse_params,
+    make_lr_schedule,
+)
 from .config import AdamConfig, LionConfig, OptimizerConfig
 from .adamh import AdamHConfig
 from .kron import KronConfig
